@@ -1,51 +1,142 @@
-
-import base64
-import io
-import json
-import os
+from PIL.PngImagePlugin import PngInfo
 from pathlib import Path
-from urllib.parse import unquote
-from .core.core import get_sha256,dencrypt_image,dencrypt_image_v2,encrypt_image_v2
-from PIL import PngImagePlugin,_util,ImagePalette
-from PIL import Image as PILImage
-from io import BytesIO
-from typing import Optional
-import sys
 import folder_paths
+from PIL import Image as PILImage, PngImagePlugin, _util, ImagePalette
+import numpy as np
+import hashlib
+import base64
+import json
+import sys
+from typing import Optional
 from comfy.cli_args import args
 
-from PIL import Image
-from PIL.PngImagePlugin import PngInfo
+# Constants
+ENCRYPT_PREFIX = "ENC:"
+TAG_LIST = ['parameters', 'UserComment', 'prompt', 'workflow']
+IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', '.avif']
+IMAGE_KEYS = ['Encrypt', 'EncryptPwdSha']
 
-import numpy as np
+# Password setup (can be changed via node)
+_password = "123qwe"
 
-_password = '123qwe'
+# Helper functions
+def get_range(input_str: str, offset: int, range_len=4) -> str:
+    offset = offset % len(input_str)
+    return (input_str * 2)[offset:offset + range_len]
 
-            
+def get_sha256(input_str: str) -> str:
+    return hashlib.sha256(input_str.encode('utf-8')).hexdigest()
+
+def shuffle_array(arr, key):
+    sha_key = get_sha256(key)
+    arr_len = len(arr)
+    for i in range(arr_len):
+        s_idx = arr_len - i - 1
+        to_index = int(get_range(sha_key, i, range_len=8), 16) % (arr_len - i)
+        arr[s_idx], arr[to_index] = arr[to_index], arr[s_idx]
+    return arr
+
+def encrypt_tags(metadata, password):
+    if not password:
+        return metadata
+    encrypted_metadata = metadata.copy()
+    for key in TAG_LIST:
+        if key in metadata:
+            value = str(metadata[key])
+            encrypted_value = ''.join(
+                chr(ord(c) ^ ord(password[i % len(password)]))
+                for i, c in enumerate(value)
+            )
+            encrypted_value = base64.b64encode(encrypted_value.encode('utf-8')).decode('utf-8')
+            encrypted_metadata[key] = f"{ENCRYPT_PREFIX}{encrypted_value}"
+    return encrypted_metadata
+
+def decrypt_tags(metadata, password):
+    if not password:
+        return metadata
+    decrypted_metadata = metadata.copy()
+    for key in TAG_LIST:
+        if key in metadata and str(metadata[key]).startswith(ENCRYPT_PREFIX):
+            encrypted_value = metadata[key][len(ENCRYPT_PREFIX):]
+            try:
+                decoded = base64.b64decode(encrypted_value).decode('utf-8')
+                decrypted_value = ''.join(
+                    chr(ord(c) ^ ord(password[i % len(password)]))
+                    for i, c in enumerate(decoded)
+                )
+                decrypted_metadata[key] = decrypted_value
+            except Exception:
+                decrypted_metadata[key] = metadata[key]
+    return decrypted_metadata
+
+def encrypt_image(image: PILImage.Image, password):
+    try:
+        width, height = image.size
+        x_arr = np.arange(width)
+        shuffle_array(x_arr, password)
+        y_arr = np.arange(height)
+        shuffle_array(y_arr, get_sha256(password))
+        pixel_array = np.array(image)
+
+        _pixel_array = pixel_array.copy()
+        for x in range(height):
+            pixel_array[x] = _pixel_array[y_arr[x]]
+        pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
+
+        _pixel_array = pixel_array.copy()
+        for x in range(width):
+            pixel_array[x] = _pixel_array[x_arr[x]]
+        pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
+
+        return pixel_array
+    except Exception:
+        return np.array(image)
+
+def decrypt_image(image: PILImage.Image, password):
+    try:
+        width, height = image.size
+        x_arr = np.arange(width)
+        shuffle_array(x_arr, password)
+        y_arr = np.arange(height)
+        shuffle_array(y_arr, get_sha256(password))
+        pixel_array = np.array(image)
+
+        _pixel_array = pixel_array.copy()
+        for x in range(height):
+            pixel_array[y_arr[x]] = _pixel_array[x]
+        pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
+
+        _pixel_array = pixel_array.copy()
+        for x in range(width):
+            pixel_array[x_arr[x]] = _pixel_array[x]
+        pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
+
+        return pixel_array
+    except Exception:
+        return np.array(image)
+
+# Encrypted Image class
 if PILImage.Image.__name__ != 'EncryptedImage':
-    
     super_open = PILImage.open
     
     class EncryptedImage(PILImage.Image):
         __name__ = "EncryptedImage"
+        
         @staticmethod
-        def from_image(image:PILImage.Image):
+        def from_image(image: PILImage.Image):
             image = image.copy()
             img = EncryptedImage()
             img.im = image.im
-            img._mode = image.im.mode
+            img._mode = image.mode
             if image.im.mode:
                 try:
                     img.mode = image.im.mode
-                except Exception as e:
-                    ''
+                except Exception:
+                    pass
             img._size = image.size
             img.format = image.format
             if image.mode in ("P", "PA"):
-                if image.palette:
-                    img.palette = image.palette.copy()
-                else:
-                    img.palette = ImagePalette.ImagePalette()
+                img.palette = image.palette.copy() if image.palette else ImagePalette.ImagePalette()
             img.info = image.info.copy()
             return img
             
@@ -60,111 +151,121 @@ if PILImage.Image.__name__ != 'EncryptedImage':
                     fp = sys.stdout.buffer
                 except AttributeError:
                     pass
+            
             if not filename and hasattr(fp, "name") and _util.is_path(fp.name):
-                # only set the name for metadata purposes
                 filename = fp.name
             
             if not filename or not _password:
-                # 如果没有密码或不保存到硬盘，直接保存
-                super().save(fp, format = format, **params)
+                super().save(fp, format=format, **params)
                 return
             
-            if 'Encrypt' in self.info and (self.info['Encrypt'] == 'pixel_shuffle' or self.info['Encrypt'] == 'pixel_shuffle_2'):
-                super().save(fp, format = format, **params)
+            if self.info.get('Encrypt') == 'pixel_shuffle_3':
+                super().save(fp, format=format, **params)
                 return
             
-            encrypt_image_v2(self, get_sha256(_password))
-            self.format = PngImagePlugin.PngImageFile.format
-            pnginfo = params.get('pnginfo', PngImagePlugin.PngInfo())
-            if not pnginfo:
-                pnginfo = PngImagePlugin.PngInfo()
-                for key in (self.info or {}).keys():
-                    if self.info[key]:
-                        pnginfo.add_text(key,str(self.info[key]))
-            pnginfo.add_text('Encrypt', 'pixel_shuffle_2')
-            pnginfo.add_text('EncryptPwdSha', get_sha256(f'{get_sha256(_password)}Encrypt'))
-            params.update(pnginfo=pnginfo)
-            super().save(fp, format=self.format, **params)
-            # 保存到文件后解密内存内的图片，让直接在内存内使用时图片正常
-            dencrypt_image_v2(self, get_sha256(_password)) 
+            # Create backup of original image
+            back_img = PILImage.new('RGBA', self.size)
+            back_img.paste(self)
             
-    def open(fp,*args, **kwargs):
-        image = super_open(fp,*args, **kwargs)
-        if _password and image.format.lower() == PngImagePlugin.PngImageFile.format.lower():
-            pnginfo = image.info or {}
-            if 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle':
-                dencrypt_image(image, get_sha256(_password))
-                pnginfo["Encrypt"] = None
-                image = EncryptedImage.from_image(image=image)
-                return image
-            if 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle_2':
-                dencrypt_image_v2(image, get_sha256(_password))
-                pnginfo["Encrypt"] = None
-                image = EncryptedImage.from_image(image=image)
-                return image
-        return EncryptedImage.from_image(image=image)
+            try:
+                # Encrypt image
+                encrypted_img = PILImage.fromarray(encrypt_image(self, get_sha256(_password)))
+                self.paste(encrypted_img)
+                encrypted_img.close()
+                
+                # Prepare metadata
+                encrypted_info = encrypt_tags(self.info, _password)
+                pnginfo = params.get('pnginfo', PngImagePlugin.PngInfo()) or PngImagePlugin.PngInfo()
+                
+                for key, value in encrypted_info.items():
+                    if value:
+                        pnginfo.add_text(key, str(value))
+                
+                pnginfo.add_text('Encrypt', 'pixel_shuffle_3')
+                pnginfo.add_text('EncryptPwdSha', get_sha256(f'{get_sha256(_password)}Encrypt'))
+                
+                params.update(pnginfo=pnginfo)
+                self.format = PngImagePlugin.PngImageFile.format
+                super().save(fp, format=self.format, **params)
+                
+            except Exception as e:
+                if "axes don't match array" in str(e):
+                    if filename:
+                        fn = Path(filename)
+                        try:
+                            fn.unlink(missing_ok=True)
+                        except:
+                            pass
+                raise
+            finally:
+                # Restore original image in memory
+                self.paste(back_img)
+                back_img.close()
 
-    # if _password:
-    PILImage.Image = EncryptedImage
-    PILImage.open = open
+    def open_image(fp, *args, **kwargs):
+        try:
+            if not _util.is_path(fp) or not Path(fp).suffix:
+                return super_open(fp, *args, **kwargs)
+                
+            img = super_open(fp, *args, **kwargs)
+            
+            if _password and img.format.lower() == PngImagePlugin.PngImageFile.format.lower():
+                pnginfo = img.info or {}
+                pnginfo = decrypt_tags(pnginfo, _password)
+                
+                if pnginfo.get("Encrypt") == 'pixel_shuffle_3':
+                    decrypted_img = PILImage.fromarray(decrypt_image(img, get_sha256(_password)))
+                    img.paste(decrypted_img)
+                    decrypted_img.close()
+                    pnginfo["Encrypt"] = None
+                    
+            return EncryptedImage.from_image(img)
+            
+        except Exception:
+            return super_open(fp, *args, **kwargs)
     
-    print('图片加密插件加载成功')
+    # Override PIL functions
+    PILImage.Image = EncryptedImage
+    PILImage.open = open_image
 
-# 这是一个节点，用于设置密码，即使不设置，也有默认密码 123qwe
-class EncryptImage:
+# ComfyUI Node - Password Change Node
+class EncryptImagePasswordNode:
+    """
+    Node for changing the encryption password.
+    Connect to this node and provide a new password to change it.
+    """
+    
     def __init__(self):
-        self.output_dir = os.path.join(folder_paths.get_output_directory(),'encryptd')
-        self.type = "output"
-        self.prefix_append = ""
-        self.compress_level = 4
+        pass
+        
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls):
         return {
             "required": {
-                "images": ("IMAGE",),
-                "password":  ("STRING", {"default": "123qwe"}),
-                "filename_prefix": ("STRING", {"default": "ComfyUI"}),
-                },
-        "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+                "new_password": ("STRING", {"default": "", "multiline": False}),
+            },
+            "optional": {
+                "dummy_input": ("*", {}),
+            }
         }
         
     RETURN_TYPES = ()
-    FUNCTION = 'set_password'
-    
+    FUNCTION = "change_password"
+    CATEGORY = "utils/encryption"
     OUTPUT_NODE = True
-
-    CATEGORY = "utils"
     
-    def set_password(self,images,password,filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None):
+    def change_password(self, new_password, dummy_input=None):
         global _password
-        _password = password
-        filename_prefix += self.prefix_append
-        full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
-        results = list()
-        for image in images:
-            i = 255. * image.cpu().numpy()
-            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-            metadata = None
-            if not args.disable_metadata:
-                metadata = PngInfo()
-                if prompt is not None:
-                    metadata.add_text("prompt", json.dumps(prompt))
-                if extra_pnginfo is not None:
-                    for x in extra_pnginfo:
-                        metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+        if new_password and new_password.strip():
+            _password = new_password.strip()
+            print(f"Encryption password changed to: {_password}")
+        return ()
 
-            file = f"{filename}_{counter:05}_.png"
-            img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=self.compress_level)
-            results.append({
-                "filename": file,
-                "subfolder": os.path.join('encryptd',subfolder),
-                "type": self.type,
-                'channel':'rgb'
-            })
-            counter += 1
-
-        return { "ui": { "images": results} }
-    
+# Node mappings
 NODE_CLASS_MAPPINGS = {
-    "EncryptImage": EncryptImage
+    "EncryptImagePassword": EncryptImagePasswordNode
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "EncryptImagePassword": "🔒 Change Encryption Password"
 }
