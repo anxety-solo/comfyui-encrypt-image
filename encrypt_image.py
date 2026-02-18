@@ -272,17 +272,26 @@ if PILImage.Image.__name__ != 'EncryptedImage':
                 enc_arr = encrypt_image(self, get_sha256(_password))
                 self.paste(PILImage.fromarray(enc_arr, mode='RGBA'))
 
-                pnginfo = params.get('pnginfo') or PngInfo()
-                if self.info.get('Encrypt') != ENCRYPT_MARKER:
-                    enc_meta = encrypt_tags(self.info, _password)
-                    for k, v in enc_meta.items():
-                        if v and k not in IMAGE_KEYS:
-                            pnginfo.add_text(k, str(v))
+                meta = {}
+                orig = params.get('pnginfo')
+                if orig and hasattr(orig, 'chunks'):
+                    for t, d in orig.chunks:
+                        if t in (b'tEXt', b'iTXt'):
+                            try:
+                                k, v = d.split(b'\x00', 1)
+                                meta[k.decode()] = v.decode(errors='ignore')
+                            except:
+                                pass
+
+                meta = encrypt_tags(meta or self.info, _password)
+                pnginfo = PngInfo()
+                for k, v in meta.items():
+                    if v and k not in IMAGE_KEYS:
+                        pnginfo.add_text(k, str(v))
 
                 pnginfo.add_text('Encrypt', ENCRYPT_MARKER)
                 pnginfo.add_text('EncryptPwdSha', get_sha256(f"{get_sha256(_password)}Encrypt"))
-
-                params['pnginfo'] = pnginfo
+                params["pnginfo"] = pnginfo
                 self.format = PngImagePlugin.PngImageFile.format
                 super().save(fp, format=self.format, **params)
             except Exception as e:
