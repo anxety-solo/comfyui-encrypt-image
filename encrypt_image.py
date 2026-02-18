@@ -1,6 +1,7 @@
 import traceback
 import hashlib
 import base64
+import json
 import sys
 import io
 from pathlib import Path
@@ -14,7 +15,7 @@ from PIL.PngImagePlugin import PngInfo
 
 ENCRYPT_PREFIX = 'SOBA:'
 ENCRYPT_MARKER = 'pixel_shuffle_3'
-TAG_LIST = ['parameters', 'UserComment']
+TAG_LIST = ['parameters', 'UserComment', 'prompt', 'workflow']
 IMAGE_KEYS = ['Encrypt', 'EncryptPwdSha']
 MISMATCH_ERROR = "axes don't match array"
 
@@ -71,12 +72,14 @@ def _shuffle(arr: np.ndarray, key: str) -> np.ndarray:
 # ~~ Metadata encryption / decryption ~~
 
 def encrypt_tags(metadata: dict, password: str) -> dict:
-    """XOR-encrypt TAG_LIST values, base64-encode, and prepend prefix"""
+    """XOR-encrypt all TAG_LIST values, base64-encode, prepend SOBA: prefix"""
     out = metadata.copy()
     for key in TAG_LIST:
         val = out.get(key)
         if not val:
             continue
+        if str(val).startswith(ENCRYPT_PREFIX):
+            continue  # already encrypted
         xored = ''.join(
             chr(ord(c) ^ ord(password[i % len(password)]))
             for i, c in enumerate(str(val))
@@ -85,7 +88,7 @@ def encrypt_tags(metadata: dict, password: str) -> dict:
     return out
 
 def decrypt_tags(metadata: dict, password: str) -> dict:
-    """Reverse of encrypt_tags; non-encrypted values pass through unchanged"""
+    """Reverse of encrypt_tags; values without the prefix pass through"""
     out = metadata.copy()
     for key in TAG_LIST:
         val = str(out.get(key, ''))
@@ -154,7 +157,7 @@ def decrypt_image(image: PILImage.Image, password: str) -> np.ndarray:
 # ~~ Core helper ~~
 
 def decrypt_file_to_png_bytes(file_path: Path) -> bytes | None:
-    """Decrypt an encrypted PNG on disk and return raw PNG bytes, or None if not encrypted"""
+    """Decrypt an encrypted PNG on disk → raw PNG bytes, or None if not encrypted"""
     try:
         img = _pil_open_original(str(file_path))
         if img.info.get('Encrypt') != ENCRYPT_MARKER:
@@ -182,6 +185,43 @@ def decrypt_file_to_png_bytes(file_path: Path) -> bytes | None:
         log.error(f"decrypt_file_to_png_bytes({file_path.name}): {e}")
         return None
 
+def encrypt_file_inplace(file_path: Path) -> bool:
+    """Encrypt a PNG file in-place (used for /input uploads)"""
+    try:
+        img = _pil_open_original(str(file_path))
+
+        if img.info.get('Encrypt') == ENCRYPT_MARKER:
+            img.close()
+            return False  # already encrypted
+
+        existing_meta = dict(img.info)
+        enc_meta = encrypt_tags(existing_meta, _password)
+
+        enc_arr = encrypt_image(img, get_sha256(_password))
+        img.close()
+
+        enc_img = PILImage.fromarray(enc_arr, mode='RGBA')
+
+        pnginfo = PngInfo()
+        for k, v in enc_meta.items():
+            if v is not None and k not in IMAGE_KEYS:
+                try:
+                    pnginfo.add_text(k, str(v))
+                except Exception:
+                    pass
+        pnginfo.add_text('Encrypt', ENCRYPT_MARKER)
+        pnginfo.add_text('EncryptPwdSha', get_sha256(f"{get_sha256(_password)}Encrypt"))
+
+        # Call the real PIL save to avoid being caught by EncryptedImage.save()
+        # which would try to double-encrypt
+        PILImage.Image.__bases__[0].save(enc_img, str(file_path), format='PNG', pnginfo=pnginfo)
+        enc_img.close()
+        log.success(f"Encrypted input file: {file_path.name}")
+        return True
+    except Exception as e:
+        log.error(f"encrypt_file_inplace({file_path.name}): {e}")
+        return False
+
 
 # ~~ PIL monkey-patch ~~
 
@@ -195,10 +235,8 @@ if PILImage.Image.__name__ != 'EncryptedImage':
 
         @staticmethod
         def from_image(src: PILImage.Image) -> 'EncryptedImage':
-            """Wrap an existing PIL Image as an EncryptedImage"""
             src = src.copy()
             img = EncryptedImage()
-
             img.im = src.im
             img._mode = src.mode
             try:
@@ -206,19 +244,15 @@ if PILImage.Image.__name__ != 'EncryptedImage':
                     img.mode = src.im.mode
             except Exception:
                 pass
-
             img._size = src.size
             img.format = src.format
             if src.mode in ('P', 'PA'):
                 img.palette = src.palette.copy() if src.palette else ImagePalette.ImagePalette()
-
             img.info = src.info.copy()
             return img
 
         def save(self, fp, format=None, **params):
-            """Save with transparent pixel-shuffle encryption when a password is set"""
             filename = ''
-
             if isinstance(fp, Path):
                 filename = str(fp)
             elif _util.is_path(fp):
@@ -238,11 +272,13 @@ if PILImage.Image.__name__ != 'EncryptedImage':
                 enc_arr = encrypt_image(self, get_sha256(_password))
                 self.paste(PILImage.fromarray(enc_arr, mode='RGBA'))
 
-                enc_meta = encrypt_tags(self.info, _password)
                 pnginfo = params.get('pnginfo') or PngInfo()
-                for k, v in enc_meta.items():
-                    if v:
-                        pnginfo.add_text(k, str(v))
+                if self.info.get('Encrypt') != ENCRYPT_MARKER:
+                    enc_meta = encrypt_tags(self.info, _password)
+                    for k, v in enc_meta.items():
+                        if v and k not in IMAGE_KEYS:
+                            pnginfo.add_text(k, str(v))
+
                 pnginfo.add_text('Encrypt', ENCRYPT_MARKER)
                 pnginfo.add_text('EncryptPwdSha', get_sha256(f"{get_sha256(_password)}Encrypt"))
 
@@ -290,22 +326,24 @@ else:
 # ~~ aiohttp middleware ~~
 
 def _register_middleware() -> None:
-    """Register decryption middleware for all image responses in ComfyUI's aiohttp app"""
+    """Register middleware: decrypt served images + encrypt uploads"""
     try:
         from aiohttp import web
         from server import PromptServer
+        import folder_paths
 
+        input_dir = Path(folder_paths.get_input_directory())
+
+        # Middleware 1: serve decrypted images transparently
         @web.middleware
         async def _decrypt_middleware(request: web.Request, handler) -> web.Response:
             response = await handler(request)
 
             if not isinstance(response, web.FileResponse):
                 return response
-
             file_path = getattr(response, '_path', None)
             if not file_path or Path(file_path).suffix.lower() != '.png':
                 return response
-
             if not _password:
                 return response
 
@@ -319,9 +357,67 @@ def _register_middleware() -> None:
                 headers={'Cache-Control': 'no-cache, no-store, must-revalidate'},
             )
 
+        # Middleware 2: encrypt images uploaded to the /input folder
+        @web.middleware
+        async def _upload_encrypt_middleware(request: web.Request, handler) -> web.Response:
+            response = await handler(request)
+
+            if request.method != 'POST':
+                return response
+            if not request.path.rstrip('/').endswith('/upload/image'):
+                return response
+            if response.status not in (200, 201):
+                return response
+
+            try:
+                body_bytes = b''
+                if hasattr(response, 'body') and response.body:
+                    body_bytes = response.body
+                elif hasattr(response, 'text') and response.text:
+                    body_bytes = response.text.encode()
+
+                data      = json.loads(body_bytes)
+                filename  = data.get('name', '')
+                subfolder = data.get('subfolder', '')
+                file_type = data.get('type', 'input')
+
+                if not filename or file_type != 'input':
+                    return response
+
+                file_path = (input_dir / subfolder / filename
+                             if subfolder else input_dir / filename)
+
+                if not file_path.exists():
+                    return response
+
+                # Try to open as image — if PIL can't open it
+                try:
+                    img = _pil_open_original(str(file_path))
+                    img.verify()
+                    img = _pil_open_original(str(file_path))  # reopen after verify()
+                except Exception:
+                    log.warning(f"Skipping non-image upload: {filename}")
+                    return response
+
+                already_encrypted = img.info.get('Encrypt') == ENCRYPT_MARKER
+                img.close()
+
+                if already_encrypted:
+                    return response  # PNG already encrypted, nothing to do
+
+                # For all image formats: convert → encrypted PNG in-place
+                encrypt_file_inplace(file_path)
+
+            except Exception as e:
+                log.error(f"Upload encrypt middleware: {e}")
+
+            return response
+
         app = PromptServer.instance.app
+        app._middlewares.insert(0, _upload_encrypt_middleware)
         app._middlewares.insert(0, _decrypt_middleware)
-        log.success('Middleware running')
+
+        log.success('Middleware running (decrypt + upload-encrypt)')
 
     except Exception as e:
         log.error(f"Middleware not running: {e}")
