@@ -15,7 +15,7 @@ from PIL.PngImagePlugin import PngInfo
 
 ENCRYPT_PREFIX = 'SOBA:'
 ENCRYPT_MARKER = 'pixel_shuffle_3'
-TAG_LIST = ['parameters', 'UserComment', 'prompt', 'workflow']
+TAG_LIST = ['prompt', 'workflow']
 IMAGE_KEYS = ['Encrypt', 'EncryptPwdSha']
 MISMATCH_ERROR = "axes don't match array"
 
@@ -54,9 +54,8 @@ def get_sha256(text: str) -> str:
 
 def _get_range(s: str, offset: int, length: int = 4) -> str:
     """Return a circular substring of *s* starting at *offset*"""
-    s *= 2
-    offset %= len(s) // 2
-    return s[offset:offset + length]
+    offset %= len(s)
+    return (s * 2)[offset:offset + length]
 
 def _shuffle(arr: np.ndarray, key: str) -> np.ndarray:
     """Deterministic Fisher-Yates shuffle driven by SHA-256(key)"""
@@ -68,23 +67,50 @@ def _shuffle(arr: np.ndarray, key: str) -> np.ndarray:
         arr[k], arr[j] = arr[j], arr[k]
     return arr
 
+def _xor_str(text: str, password: str) -> str:
+    """XOR each character of text against the repeating password"""
+    return ''.join(
+        chr(ord(c) ^ ord(password[i % len(password)]))
+        for i, c in enumerate(text)
+    )
+
+def _build_pnginfo(meta: dict, extra: dict | None = None) -> PngInfo:
+    """Build PngInfo from a metadata dict, skipping IMAGE_KEYS; extra keys are appended last"""
+    pnginfo = PngInfo()
+    for k, v in meta.items():
+        if v is not None and k not in IMAGE_KEYS:
+            try:
+                pnginfo.add_text(k, str(v))
+            except Exception:
+                pass
+    for k, v in (extra or {}).items():
+        pnginfo.add_text(k, v)
+    return pnginfo
+
+def _meta_from_pnginfo(pnginfo) -> dict:
+    """Extract tEXt/iTXt key-value pairs from a PngInfo object"""
+    meta = {}
+    if pnginfo and hasattr(pnginfo, 'chunks'):
+        for chunk in pnginfo.chunks:
+            try:
+                t, d = chunk[0], chunk[1]
+                if t in (b'tEXt', b'iTXt'):
+                    k, v = d.split(b'\x00', 1)
+                    meta[k.decode()] = v.decode(errors='ignore')
+            except Exception:
+                pass
+    return meta
+
 
 # ~~ Metadata encryption / decryption ~~
 
 def encrypt_tags(metadata: dict, password: str) -> dict:
-    """XOR-encrypt all TAG_LIST values, base64-encode, prepend SOBA: prefix"""
+    """XOR-encrypt all TAG_LIST values, base64-encode, prepend prefix"""
     out = metadata.copy()
     for key in TAG_LIST:
-        val = out.get(key)
-        if not val:
-            continue
-        if str(val).startswith(ENCRYPT_PREFIX):
-            continue  # already encrypted
-        xored = ''.join(
-            chr(ord(c) ^ ord(password[i % len(password)]))
-            for i, c in enumerate(str(val))
-        )
-        out[key] = ENCRYPT_PREFIX + base64.b64encode(xored.encode('utf-8')).decode('utf-8')
+        val = str(out.get(key) or '')
+        if val and not val.startswith(ENCRYPT_PREFIX):
+            out[key] = ENCRYPT_PREFIX + base64.b64encode(_xor_str(val, password).encode()).decode()
     return out
 
 def decrypt_tags(metadata: dict, password: str) -> dict:
@@ -92,23 +118,19 @@ def decrypt_tags(metadata: dict, password: str) -> dict:
     out = metadata.copy()
     for key in TAG_LIST:
         val = str(out.get(key, ''))
-        if not val.startswith(ENCRYPT_PREFIX):
-            continue
-        try:
-            raw = base64.b64decode(val[len(ENCRYPT_PREFIX):]).decode('utf-8')
-            out[key] = ''.join(
-                chr(ord(c) ^ ord(password[i % len(password)]))
-                for i, c in enumerate(raw)
-            )
-        except Exception:
-            pass
+        if val.startswith(ENCRYPT_PREFIX):
+            try:
+                raw = base64.b64decode(val[len(ENCRYPT_PREFIX):]).decode()
+                out[key] = _xor_str(raw, password)
+            except Exception:
+                pass
     return out
 
 
 # ~~ Pixel-shuffle image encryption / decryption ~~
 
-def encrypt_image(image: PILImage.Image, password: str) -> np.ndarray:
-    """Pixel-shuffle encrypt an image (rows then columns)"""
+def _permute_image(image: PILImage.Image, password: str, inverse: bool = False) -> np.ndarray:
+    """Permute rows then columns of image pixels; set inverse=True to reverse"""
     try:
         if image.mode != 'RGBA':
             image = image.convert('RGBA')
@@ -116,42 +138,24 @@ def encrypt_image(image: PILImage.Image, password: str) -> np.ndarray:
         w, h = image.size
         px = np.array(image, dtype=np.uint8)
 
-        y = _shuffle(np.arange(h), get_sha256(password))
-        x = _shuffle(np.arange(w), password)
+        y_perm = _shuffle(np.arange(h), get_sha256(password))
+        x_perm = _shuffle(np.arange(w), password)
+        if inverse:
+            y_perm, x_perm = np.argsort(y_perm), np.argsort(x_perm)
 
-        px = px[y]    # permute rows
-        px = px.transpose(1, 0, 2)
-        px = px[x]    # permute columns
-        px = px.transpose(1, 0, 2)
-
-        return px
+        return px[y_perm].transpose(1, 0, 2)[x_perm].transpose(1, 0, 2)
     except Exception as e:
         if MISMATCH_ERROR not in str(e):
-            log.error(f"encrypt_image: {e}")
+            log.error(f"_permute_image: {e}")
         return np.array(image.convert('RGBA'), dtype=np.uint8)
+
+def encrypt_image(image: PILImage.Image, password: str) -> np.ndarray:
+    """Pixel-shuffle encrypt an image (rows then columns)"""
+    return _permute_image(image, password)
 
 def decrypt_image(image: PILImage.Image, password: str) -> np.ndarray:
     """Exact inverse of encrypt_image"""
-    try:
-        if image.mode != 'RGBA':
-            image = image.convert('RGBA')
-
-        w, h = image.size
-        px = np.array(image, dtype=np.uint8)
-
-        inv_y = np.argsort(_shuffle(np.arange(h), get_sha256(password)))
-        inv_x = np.argsort(_shuffle(np.arange(w), password))
-
-        px = px[inv_y]    # restore rows
-        px = px.transpose(1, 0, 2)
-        px = px[inv_x]    # restore columns
-        px = px.transpose(1, 0, 2)
-
-        return px
-    except Exception as e:
-        if MISMATCH_ERROR not in str(e):
-            log.error(f"decrypt_image: {e}")
-        return np.array(image.convert('RGBA'), dtype=np.uint8)
+    return _permute_image(image, password, inverse=True)
 
 
 # ~~ Core helper ~~
@@ -169,16 +173,8 @@ def decrypt_file_to_png_bytes(file_path: Path) -> bytes | None:
         img.close()
 
         dec_img = PILImage.fromarray(arr, mode='RGBA')
-        pnginfo = PngInfo()
-        for k, v in meta.items():
-            if v is not None and k not in IMAGE_KEYS:
-                try:
-                    pnginfo.add_text(k, str(v))
-                except Exception:
-                    pass
-
         buf = io.BytesIO()
-        dec_img.save(buf, format='PNG', pnginfo=pnginfo)
+        dec_img.save(buf, format='PNG', pnginfo=_build_pnginfo(meta))
         dec_img.close()
         return buf.getvalue()
     except Exception as e:
@@ -189,29 +185,19 @@ def encrypt_file_inplace(file_path: Path) -> bool:
     """Encrypt a PNG file in-place (used for /input uploads)"""
     try:
         img = _pil_open_original(str(file_path))
-
         if img.info.get('Encrypt') == ENCRYPT_MARKER:
             img.close()
-            return False  # already encrypted
+            return False
 
-        existing_meta = dict(img.info)
-        enc_meta = encrypt_tags(existing_meta, _password)
-
+        enc_meta = encrypt_tags(dict(img.info), _password)
         enc_arr = encrypt_image(img, get_sha256(_password))
         img.close()
 
         enc_img = PILImage.fromarray(enc_arr, mode='RGBA')
-
-        pnginfo = PngInfo()
-        for k, v in enc_meta.items():
-            if v is not None and k not in IMAGE_KEYS:
-                try:
-                    pnginfo.add_text(k, str(v))
-                except Exception:
-                    pass
-        pnginfo.add_text('Encrypt', ENCRYPT_MARKER)
-        pnginfo.add_text('EncryptPwdSha', get_sha256(f"{get_sha256(_password)}Encrypt"))
-
+        pnginfo = _build_pnginfo(enc_meta, {
+            'Encrypt': ENCRYPT_MARKER,
+            'EncryptPwdSha': get_sha256(f"{get_sha256(_password)}Encrypt"),
+        })
         # Call the real PIL save to avoid being caught by EncryptedImage.save()
         # which would try to double-encrypt
         PILImage.Image.__bases__[0].save(enc_img, str(file_path), format='PNG', pnginfo=pnginfo)
@@ -235,6 +221,7 @@ if PILImage.Image.__name__ != 'EncryptedImage':
 
         @staticmethod
         def from_image(src: PILImage.Image) -> 'EncryptedImage':
+            """Construct an EncryptedImage by copying all attributes from an existing PIL Image"""
             src = src.copy()
             img = EncryptedImage()
             img.im = src.im
@@ -252,6 +239,7 @@ if PILImage.Image.__name__ != 'EncryptedImage':
             return img
 
         def save(self, fp, format=None, **params):
+            """Save the image, encrypting pixels and metadata on the fly; on error log and abort"""
             filename = ''
             if isinstance(fp, Path):
                 filename = str(fp)
@@ -269,38 +257,17 @@ if PILImage.Image.__name__ != 'EncryptedImage':
             backup = PILImage.new('RGBA', self.size)
             backup.paste(self)
             try:
-                enc_arr = encrypt_image(self, get_sha256(_password))
-                self.paste(PILImage.fromarray(enc_arr, mode='RGBA'))
-
-                meta = {}
-                orig = params.get('pnginfo')
-                if orig and hasattr(orig, 'chunks'):
-                    for t, d in orig.chunks:
-                        if t in (b'tEXt', b'iTXt'):
-                            try:
-                                k, v = d.split(b'\x00', 1)
-                                meta[k.decode()] = v.decode(errors='ignore')
-                            except:
-                                pass
-
-                meta = encrypt_tags(meta or self.info, _password)
-                pnginfo = PngInfo()
-                for k, v in meta.items():
-                    if v and k not in IMAGE_KEYS:
-                        pnginfo.add_text(k, str(v))
-
-                pnginfo.add_text('Encrypt', ENCRYPT_MARKER)
-                pnginfo.add_text('EncryptPwdSha', get_sha256(f"{get_sha256(_password)}Encrypt"))
-                params["pnginfo"] = pnginfo
+                self.paste(PILImage.fromarray(encrypt_image(self, get_sha256(_password)), mode='RGBA'))
+                raw_meta = _meta_from_pnginfo(params.get('pnginfo'))
+                meta = encrypt_tags(raw_meta or self.info, _password)
+                params['pnginfo'] = _build_pnginfo(meta, {
+                    'Encrypt': ENCRYPT_MARKER,
+                    'EncryptPwdSha': get_sha256(f"{get_sha256(_password)}Encrypt"),
+                })
                 self.format = PngImagePlugin.PngImageFile.format
                 super().save(fp, format=self.format, **params)
             except Exception as e:
-                if MISMATCH_ERROR in str(e) and filename:
-                    try:
-                        Path(filename).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                raise
+                log.error(f"EncryptedImage.save({filename!r}): {e}")
             finally:
                 self.paste(backup)
                 backup.close()
@@ -316,11 +283,9 @@ if PILImage.Image.__name__ != 'EncryptedImage':
             if _password and img.format and img.format.lower() == 'png':
                 meta = decrypt_tags(img.info or {}, _password)
                 if meta.get('Encrypt') == ENCRYPT_MARKER:
-                    arr = decrypt_image(img, get_sha256(_password))
-                    img.paste(PILImage.fromarray(arr, mode='RGBA'))
+                    img.paste(PILImage.fromarray(decrypt_image(img, get_sha256(_password)), mode='RGBA'))
                     meta['Encrypt'] = None
                 img.info = meta
-
             return EncryptedImage.from_image(img)
         except Exception:
             return _pil_open_original(fp, *args, **kwargs)
@@ -346,14 +311,14 @@ def _register_middleware() -> None:
         # Middleware 1: serve decrypted images transparently
         @web.middleware
         async def _decrypt_middleware(request: web.Request, handler) -> web.Response:
+            """Intercept file responses and return decrypted PNG bytes if the file is encrypted"""
             response = await handler(request)
 
-            if not isinstance(response, web.FileResponse):
-                return response
             file_path = getattr(response, '_path', None)
-            if not file_path or Path(file_path).suffix.lower() != '.png':
-                return response
-            if not _password:
+            if (not isinstance(response, web.FileResponse)
+                    or not file_path
+                    or Path(file_path).suffix.lower() != '.png'
+                    or not _password):
                 return response
 
             png_bytes = decrypt_file_to_png_bytes(Path(file_path))
@@ -369,33 +334,24 @@ def _register_middleware() -> None:
         # Middleware 2: encrypt images uploaded to the /input folder
         @web.middleware
         async def _upload_encrypt_middleware(request: web.Request, handler) -> web.Response:
+            """Intercept image uploads to /input and encrypt the saved file in-place"""
             response = await handler(request)
 
-            if request.method != 'POST':
-                return response
-            if not request.path.rstrip('/').endswith('/upload/image'):
-                return response
-            if response.status not in (200, 201):
+            if (request.method != 'POST'
+                    or not request.path.rstrip('/').endswith('/upload/image')
+                    or response.status not in (200, 201)):
                 return response
 
             try:
-                body_bytes = b''
-                if hasattr(response, 'body') and response.body:
-                    body_bytes = response.body
-                elif hasattr(response, 'text') and response.text:
-                    body_bytes = response.text.encode()
-
-                data      = json.loads(body_bytes)
-                filename  = data.get('name', '')
+                body = (getattr(response, 'body', None)
+                        or (getattr(response, 'text', '') or '').encode())
+                data = json.loads(body)
+                filename = data.get('name', '')
                 subfolder = data.get('subfolder', '')
-                file_type = data.get('type', 'input')
 
-                if not filename or file_type != 'input':
+                if not filename or data.get('type', 'input') != 'input':
                     return response
-
-                file_path = (input_dir / subfolder / filename
-                             if subfolder else input_dir / filename)
-
+                file_path = input_dir / subfolder / filename if subfolder else input_dir / filename
                 if not file_path.exists():
                     return response
 
@@ -410,13 +366,9 @@ def _register_middleware() -> None:
 
                 already_encrypted = img.info.get('Encrypt') == ENCRYPT_MARKER
                 img.close()
-
-                if already_encrypted:
-                    return response  # PNG already encrypted, nothing to do
-
-                # For all image formats: convert → encrypted PNG in-place
-                encrypt_file_inplace(file_path)
-
+                if not already_encrypted:
+                    # For all image formats: convert → encrypted PNG in-place
+                    encrypt_file_inplace(file_path)
             except Exception as e:
                 log.error(f"Upload encrypt middleware: {e}")
 
